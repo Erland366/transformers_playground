@@ -11,9 +11,14 @@ dependencies = [
     "lovely-tensors>=0.1.18",
     "pandas>=2.3.3",
     "python-dotenv>=1.1.1",
-    "torch>=2.7.1",
-    "torchaudio>=2.7.1",
+    "torch>=2.9.0",
+    "torchaudio>=2.9.0",
     "torchvision>=0.22.1",
     "tqdm>=4.67.1",
     "wandb>=0.22.2",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
