@@ -318,12 +318,11 @@ class TransformerConfig:
         self.head_num = head_num
         self.layer_num = layer_num
 
-def abs_softmax_1(x, dim: int = -1, eps: float = 1e-8):
+def relu_softpick_2(x, dim=-1, eps=1e-8):
     x_m = torch.max(x, dim=dim, keepdim=True).values
-    x_m_e_m = torch.exp(-x_m)
-    x_e_1 = torch.exp(x - x_m) - x_m_e_m
-    a_x_e_1 = torch.where(x.isfinite(), torch.abs(x_e_1), 0)
-    return a_x_e_1 / (torch.sum(a_x_e_1, dim=dim, keepdim=True) + eps)
+    x_e = torch.exp(x - x_m)
+    r_x_e = F.relu(x_e)
+    return x_e / (torch.sum(r_x_e, dim=dim, keepdim=True) + eps) 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
@@ -421,7 +420,7 @@ class MultiHeadAttention(nn.Module):
         wei = q @ k.transpose(-2,-1) # (B, H, 1, C/H) @ (B, H, C/H, T) -> (B, H, 1, T)
         wei = wei * self.head_size ** -0.5 # scaled attention
         wei = wei.masked_fill(self.tril[T_k-T:T_k, T_k-T:T_k] == 0, float('-inf')) # (B, T, T)
-        wei = abs_softmax_1(wei, dim=-1) # (B, H, T, T)
+        wei = relu_softpick_2(wei, dim=-1) # (B, H, T, T)
         # apply attention to values
         out = wei @ v # (B, H, 1, T) @ (B, H, T, C/H) -> (B, H, 1, C/H)
 
@@ -495,8 +494,8 @@ class TransformerLM(nn.Module):
                 logits = logits[:, -1, :] # becomes (B, C)
                 # apply temperature
                 logits = logits / temperature if temperature > 0 else logits
-                # apply abs softmax to get probabilities
-                probs = abs_softmax_1(logits, dim=-1) # (B, C)
+                # apply relu softpick to get probabilities
+                probs = relu_softpick_2(logits, dim=-1) # (B, C)
                 # sample from the distribution
                 idx_next = torch.multinomial(probs, num_samples=1) if temperature > 0 else torch.argmax(probs, dim=-1, keepdim=True) # (B, 1)
                 # append sampled index to the running sequence
@@ -515,8 +514,8 @@ class TransformerLM(nn.Module):
                 logits = logits[:, -1, :] # becomes (B, C)
                 # apply temperature
                 logits = logits / temperature if temperature > 0 else logits
-                # apply abs softmax to get probabilities
-                probs = abs_softmax_1(logits, dim=-1) # (B, C)
+                # apply softpick to get probabilities
+                probs = relu_softpick_2(logits, dim=-1) # (B, C)
                 # sample from the distribution
                 idx_next = torch.multinomial(probs, num_samples=1) if temperature > 0 else torch.argmax(probs, dim=-1, keepdim=True) # (B, 1)
                 # append sampled index to the running sequence
@@ -587,7 +586,7 @@ if use_wandb:
     wandb.init(
         project="transformers-playground",
         config=wandb_config,
-        name="abs_softmax_1-lm-animesubs-256seq-256embed-4head-6layer.AMD"
+        name="relu_softpick_2-lm-animesubs-256seq-256embed-4head-6layer.AMD"
     )
 
 losses, val_losses = train(
