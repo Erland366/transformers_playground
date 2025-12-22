@@ -326,16 +326,6 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis.to(device)
 
-def softpick(x, dim: int = -1, eps: float = 1e-8):
-    # softpick function: relu(exp(x)-1) / sum(abs(exp(x)-1))
-    # numerically stable version
-    x_m = torch.max(x, dim=dim, keepdim=True).values
-    x_m_e_m = torch.exp(-x_m)
-    x_e_1 = torch.exp(x - x_m) - x_m_e_m
-    r_x_e_1 = F.relu(x_e_1)
-    a_x_e_1 = torch.where(x.isfinite(), torch.abs(x_e_1), 0)
-    return r_x_e_1 / (torch.sum(a_x_e_1, dim=dim, keepdim=True) + eps)
-
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
@@ -387,7 +377,7 @@ class MultiHeadAttention(nn.Module):
         self.head_num = config.head_num
         self.head_size = config.embed_size // config.head_num
         self.key = nn.Linear(config.embed_size, config.embed_size, bias=False)
-        self.query = nn.Linear(config.embed_size, config.embed_size, bias=False)
+        self.query = nn.Linear(config.embed_size, config.embed_size * 2, bias=False)
         self.value = nn.Linear(config.embed_size, config.embed_size, bias=False)
         self.o = nn.Linear(config.embed_size, config.embed_size)
         # block_mask for FlexAttention
@@ -406,9 +396,14 @@ class MultiHeadAttention(nn.Module):
         v = self.value(x) # (B,T,C)
 
         # Split into heads
-        q = q.view(B, T, self.head_num, self.head_size).transpose(1, 2) # (B, H, T, C/H)
+        # q = q.view(B, T, self.head_num, self.head_size).transpose(1, 2) # (B, H, T, C/H)
         k = k.view(B, T, self.head_num, self.head_size).transpose(1, 2) # (B, H, T, C/H)
         v = v.view(B, T, self.head_num, self.head_size).transpose(1, 2) # (B, H, T, C/H)
+
+        q = q.view(B, T, self.head_num, -1)
+        q, gate_score = torch.split(q, [self.head_size * 1, self.head_size * 1], dim=-1) # For MHA, num_key_value_groups is 1
+        gate_score = gate_score.reshape(B, T, -1, self.head_size)
+        q = q.reshape(B, T, -1, self.head_size).transpose(1, 2)
 
         if kv_cache is not None:
             k_past, v_past = kv_cache
@@ -422,15 +417,19 @@ class MultiHeadAttention(nn.Module):
         T_k = k.shape[-2]
         q, k = apply_rotary_emb(q, k, self.freqs_cis[:T_k])
 
-        # compute attention scores ("affinities")
-        wei = q @ k.transpose(-2,-1) # (B, H, 1, C/H) @ (B, H, C/H, T) -> (B, H, 1, T)
-        wei = wei * self.head_size ** -0.5 # scaled attention
-        wei = wei.masked_fill(self.tril[T_k-T:T_k, T_k-T:T_k] == 0, float('-inf')) # (B, T, T)
-        wei = softpick(wei, dim=-1) # (B, H, T, T)
-        # apply attention to values
-        out = wei @ v # (B, H, 1, T) @ (B, H, T, C/H) -> (B, H, 1, C/H)
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=0,
+            is_causal=True
+        )
 
-        out = out.transpose(1, 2).contiguous().view(B, T, C) # (B, H, T, C/H) -> (B, T, H, C/H) -> (B, T, C)
+        out = out.transpose(1, 2).contiguous()
+        out = out * torch.sigmoid(gate_score)
+
+        out = out.view(B, T, C) # (B, H, T, C/H) -> (B, T, H, C/H) -> (B, T, C)
         out = self.o(out)
         return out, kv_cache
 
@@ -500,8 +499,8 @@ class TransformerLM(nn.Module):
                 logits = logits[:, -1, :] # becomes (B, C)
                 # apply temperature
                 logits = logits / temperature if temperature > 0 else logits
-                # apply softpick to get probabilities
-                probs = softpick(logits, dim=-1) # (B, C)
+                # apply softmax to get probabilities
+                probs = torch.softmax(logits, dim=-1) # (B, C)
                 # sample from the distribution
                 idx_next = torch.multinomial(probs, num_samples=1) if temperature > 0 else torch.argmax(probs, dim=-1, keepdim=True) # (B, 1)
                 # append sampled index to the running sequence
@@ -520,8 +519,8 @@ class TransformerLM(nn.Module):
                 logits = logits[:, -1, :] # becomes (B, C)
                 # apply temperature
                 logits = logits / temperature if temperature > 0 else logits
-                # apply softpick to get probabilities
-                probs = softpick(logits, dim=-1) # (B, C)
+                # apply softmax to get probabilities
+                probs = torch.softmax(logits, dim=-1) # (B, C)
                 # sample from the distribution
                 idx_next = torch.multinomial(probs, num_samples=1) if temperature > 0 else torch.argmax(probs, dim=-1, keepdim=True) # (B, 1)
                 # append sampled index to the running sequence
@@ -591,7 +590,7 @@ if use_wandb:
     wandb.init(
         project="transformers-playground",
         config=wandb_config,
-        name="softpick-lm-animesubs-256seq-256embed-4head-6layer.AMD"
+        name="gated_attention-lm-animesubs-256seq-256embed-4head-6layer.AMD"
     )
 
 losses, val_losses = train(
