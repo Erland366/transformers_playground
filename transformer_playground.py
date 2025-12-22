@@ -12,8 +12,32 @@ import triton.language as tl
 from tqdm import tqdm
 from dotenv import load_dotenv
 import matplotlib.pyplot as plt
+from datetime import datetime
 
 load_dotenv()
+
+# %%
+# Softpick function for gated attention experiment
+# Gating normalized over sequence dimension (dim=seq, i.e., dim=1 after reshaping)
+def softpick(x, dim: int = -1, eps: float = 1e-8):
+    """
+    Softpick function: relu(exp(x)-1) / sum(abs(exp(x)-1))
+
+    Unlike sigmoid, softpick normalizes over a dimension, creating competition
+    across that dimension. When dim=1 (seq dimension), gates compete across
+    sequence positions - different tokens compete for influence.
+
+    Key properties:
+    - Zeros out values where exp(x) <= 1 (x <= 0) via relu
+    - Normalizes over the specified dimension
+    - Creates competition/selection across that dimension
+    """
+    x_m = torch.max(x, dim=dim, keepdim=True).values
+    x_m_e_m = torch.exp(-x_m)
+    x_e_1 = torch.exp(x - x_m) - x_m_e_m
+    r_x_e_1 = F.relu(x_e_1)
+    a_x_e_1 = torch.where(x.isfinite(), torch.abs(x_e_1), 0)
+    return r_x_e_1 / (torch.sum(a_x_e_1, dim=dim, keepdim=True) + eps)
 
 use_wandb = True  # set to False to disable wandb logging
 wandb = None
@@ -427,7 +451,10 @@ class MultiHeadAttention(nn.Module):
         )
 
         out = out.transpose(1, 2).contiguous()
-        out = out * torch.sigmoid(gate_score)
+        # Softpick gating over sequence dimension (dim=1)
+        # gate_score shape: [B, T, num_heads, head_size]
+        # This makes gates compete across sequence positions
+        out = out * softpick(gate_score, dim=1)
 
         out = out.view(B, T, C) # (B, H, T, C/H) -> (B, T, H, C/H) -> (B, T, C)
         out = self.o(out)
@@ -590,7 +617,7 @@ if use_wandb:
     wandb.init(
         project="transformers-playground",
         config=wandb_config,
-        name="gated_attention-lm-animesubs-256seq-256embed-4head-6layer.AMD"
+        name="gated_softpick_seq-lm-animesubs-256seq-256embed-4head-6layer.AMD"
     )
 
 losses, val_losses = train(
