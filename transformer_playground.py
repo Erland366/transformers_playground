@@ -126,8 +126,8 @@ print(yb)
 # %%
 # Make all steps, sequence lengths, and batch size the same
 total_steps = 5000
-seq_len = 256
-batch_size = 256 # these are small models so we can use large batch sizes to fully utilize the GPU
+seq_len = 128
+batch_size = 32 # smaller defaults for naive KDA memory usage
 # should cover around 2x the dataset
 total_steps * seq_len * batch_size
 
@@ -166,6 +166,12 @@ def compile_optimizer_lr(opt, scheduler):
     scheduler.step()
 
 
+def maybe_compile_model(model, use_compile):
+    if not use_compile:
+        return model
+    return torch.compile(model, options=torch_compile_options, fullgraph=True)
+
+
 def save_checkpoint(model, optimizer, scheduler, step, losses, val_losses, seq_len, batch_size, total_steps, save_dir='checkpoints'):
     """Save a complete checkpoint including model, optimizer, scheduler states and training metrics"""
     os.makedirs(save_dir, exist_ok=True)
@@ -182,11 +188,19 @@ def save_checkpoint(model, optimizer, scheduler, step, losses, val_losses, seq_l
             'batch_size': batch_size,
             'total_steps': total_steps,
             'vocab_size': model.token_embedding_table.num_embeddings,
-            'embed_size': model.blocks[0].sa_heads.head_size * model.head_num,
+            'embed_size': model.token_embedding_table.embedding_dim,
             'head_num': model.head_num,
-            'layer_num': model.layer_num
+            'layer_num': model.layer_num,
+            'attn_impl': model.attn_impl,
         }
     }
+    if model.attn_impl == "kda":
+        kda_layer = model.blocks[0].sa_heads
+        checkpoint['config'].update({
+            'kda_expand_v': kda_layer.expand_v,
+            'kda_num_v_heads': kda_layer.num_v_heads,
+            'kda_allow_neg_eigval': kda_layer.allow_neg_eigval,
+        })
     
     checkpoint_path = os.path.join(save_dir, f'checkpoint_step_{step}.pt')
     torch.save(checkpoint, checkpoint_path)
@@ -207,7 +221,21 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
     print(f"Checkpoint loaded from step {checkpoint['step']}")
     return checkpoint['step'], checkpoint['train_losses'], checkpoint['val_losses']
 
-def train(model, optimizer, scheduler, seq_len, batch_size, total_steps, val_steps=10, val_interval=50, checkpoint_interval=500, save_dir='checkpoints', plot_losses=False, plot_path=None):
+def train(
+    model,
+    optimizer,
+    scheduler,
+    seq_len,
+    batch_size,
+    total_steps,
+    val_steps=10,
+    val_interval=50,
+    checkpoint_interval=500,
+    save_dir='checkpoints',
+    plot_losses=False,
+    plot_path=None,
+    use_compile=True,
+):
     losses = []
     val_losses = []
     # Create save directory
@@ -226,9 +254,14 @@ def train(model, optimizer, scheduler, seq_len, batch_size, total_steps, val_ste
         # backprop
         optimizer.zero_grad(set_to_none=True)
 
-        with torch._dynamo.compiled_autograd._enable(torch.compile()):
+        if use_compile:
+            with torch._dynamo.compiled_autograd._enable(torch.compile()):
+                loss.backward()
+            compile_optimizer_lr(optimizer, scheduler)
+        else:
             loss.backward()
-        compile_optimizer_lr(optimizer, scheduler)
+            optimizer.step()
+            scheduler.step()
 
         bar.set_description(f"loss: {loss.item():.2f}, val loss: {val_losses[-1] if val_losses else 0:.2f}, lr: {scheduler.get_last_lr()[0]:.2e}")
         losses.append(loss.item())
@@ -312,12 +345,31 @@ def perplexity(model, seq_len, ppl_seq_len, batch_size=128, val_steps=1000):
 
 # %%
 class TransformerConfig:
-    def __init__(self, vocab_size, seq_len, embed_size, head_num, layer_num):
+    def __init__(
+        self,
+        vocab_size,
+        seq_len,
+        embed_size,
+        head_num,
+        layer_num,
+        attn_impl="gated_mha",
+        kda_expand_v=1.0,
+        kda_num_v_heads=None,
+        kda_allow_neg_eigval=False,
+        kda_use_short_conv=False,
+        kda_norm_eps=1e-6,
+    ):
         self.vocab_size = vocab_size
         self.seq_len = seq_len
         self.embed_size = embed_size
         self.head_num = head_num
         self.layer_num = layer_num
+        self.attn_impl = attn_impl
+        self.kda_expand_v = kda_expand_v
+        self.kda_num_v_heads = kda_num_v_heads
+        self.kda_allow_neg_eigval = kda_allow_neg_eigval
+        self.kda_use_short_conv = kda_use_short_conv
+        self.kda_norm_eps = kda_norm_eps
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
@@ -355,6 +407,22 @@ class RMSNorm(torch.nn.Module):
     def forward(self, x):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
+
+
+class RMSNormGated(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x, gate):
+        dtype = x.dtype
+        x = x.float()
+        gate = gate.float()
+        rstd = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        out = x * rstd * self.weight
+        out = out * torch.sigmoid(gate)
+        return out.to(dtype)
     
 class FeedForward(nn.Module):
     def __init__(self, config):
@@ -368,6 +436,150 @@ class FeedForward(nn.Module):
         x = self.relu(x)
         x = self.lin_2(x)
         return x
+
+
+def kda_gate(g, a_log, dt_bias=None):
+    h = g.shape[-2]
+    g = g.float()
+    if dt_bias is not None:
+        g = g + dt_bias.view(1, 1, h, -1)
+    gate = -a_log.view(1, 1, h, 1).float().exp() * F.softplus(g)
+    return gate
+
+
+def naive_recurrent_kda(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    scale=None,
+    initial_state=None,
+    output_final_state=False,
+):
+    dtype = v.dtype
+    bsz, seq_len, heads, key_dim, value_dim = *q.shape, v.shape[-1]
+    if scale is None:
+        scale = key_dim ** -0.5
+
+    q, k, v, g, beta = map(lambda x: x.to(torch.float), [q, k, v, g, beta])
+    q = q * scale
+
+    state = k.new_zeros(bsz, heads, key_dim, value_dim).to(q)
+    if initial_state is not None:
+        state = state + initial_state
+    out = torch.zeros_like(v)
+    for i in range(seq_len):
+        q_i, k_i, v_i, g_i, b_i = q[:, i], k[:, i], v[:, i], g[:, i], beta[:, i]
+        state = state * g_i[..., None].exp()
+        state = state + torch.einsum(
+            "b h k, b h v -> b h k v",
+            b_i[..., None] * k_i,
+            v_i - (k_i[..., None] * state).sum(-2),
+        )
+        out[:, i] = torch.einsum("b h k, b h k v -> b h v", q_i, state)
+    if not output_final_state:
+        state = None
+    return out.to(dtype), state
+
+
+class KimiDeltaAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_size = config.embed_size
+        self.head_dim = config.embed_size // config.head_num
+        self.num_heads = config.head_num
+        self.num_v_heads = config.kda_num_v_heads or config.head_num
+        self.expand_v = config.kda_expand_v
+        self.allow_neg_eigval = config.kda_allow_neg_eigval
+        self.use_short_conv = config.kda_use_short_conv
+        self.norm_eps = config.kda_norm_eps
+
+        if self.use_short_conv:
+            raise ValueError("Short convolution is not supported in the playground KDA implementation.")
+
+        if self.num_v_heads != self.num_heads:
+            raise ValueError("Playground KDA currently requires num_v_heads == num_heads.")
+
+        self.head_k_dim = self.head_dim
+        self.head_v_dim = int(self.head_dim * self.expand_v)
+        if not math.isclose(self.head_dim * self.expand_v, self.head_v_dim, rel_tol=1e-5):
+            raise ValueError("expand_v must produce an integer head_v_dim.")
+
+        self.key_dim = self.num_heads * self.head_k_dim
+        self.value_dim = self.num_v_heads * self.head_v_dim
+        self.scale = self.head_k_dim ** -0.5
+
+        self.q_proj = nn.Linear(self.hidden_size, self.key_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.key_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.value_dim, bias=False)
+
+        self.f_proj = nn.Sequential(
+            nn.Linear(self.hidden_size, self.head_v_dim, bias=False),
+            nn.Linear(self.head_v_dim, self.key_dim, bias=False),
+        )
+        self.b_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
+
+        self.A_log = nn.Parameter(torch.empty(self.num_heads, dtype=torch.float32))
+        self.dt_bias = nn.Parameter(torch.zeros(self.key_dim, dtype=torch.float32))
+        with torch.no_grad():
+            self.A_log.uniform_(1.0, 16.0).log_()
+
+        self.g_proj = nn.Sequential(
+            nn.Linear(self.hidden_size, self.head_v_dim, bias=False),
+            nn.Linear(self.head_v_dim, self.value_dim, bias=True),
+        )
+        self.o_norm = RMSNormGated(self.head_v_dim, eps=self.norm_eps)
+        self.o_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+
+    def forward(self, x, kv_cache=None):
+        bsz, seq_len, _ = x.shape
+        cache_state = None
+        use_cache = False
+        if isinstance(kv_cache, dict):
+            cache_state = kv_cache.get("state")
+            use_cache = kv_cache.get("use_cache", True)
+        elif kv_cache is not None:
+            cache_state = kv_cache
+            use_cache = True
+
+        q = F.silu(self.q_proj(x))
+        k = F.silu(self.k_proj(x))
+        v = F.silu(self.v_proj(x))
+        g = self.f_proj(x)
+        beta = self.b_proj(x).sigmoid()
+
+        q = q.view(bsz, seq_len, self.num_heads, self.head_k_dim)
+        k = k.view(bsz, seq_len, self.num_heads, self.head_k_dim)
+        g = g.view(bsz, seq_len, self.num_heads, self.head_k_dim)
+        v = v.view(bsz, seq_len, self.num_v_heads, self.head_v_dim)
+
+        if self.allow_neg_eigval:
+            beta = beta * 2.0
+
+        g = kda_gate(g, self.A_log, self.dt_bias)
+        q = F.normalize(q, p=2, dim=-1)
+        k = F.normalize(k, p=2, dim=-1)
+
+        output_final_state = use_cache
+        out, new_state = naive_recurrent_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=self.scale,
+            initial_state=cache_state,
+            output_final_state=output_final_state,
+        )
+
+        gate_out = self.g_proj(x).view(bsz, seq_len, self.num_v_heads, self.head_v_dim)
+        out = self.o_norm(out, gate_out)
+        out = out.view(bsz, seq_len, self.value_dim)
+        out = self.o_proj(out)
+        if use_cache:
+            return out, {"state": new_state}
+        return out, None
 
 class MultiHeadAttention(nn.Module):
     """ multiple heads of self-attention with AliBi in parallel """
@@ -436,7 +648,12 @@ class MultiHeadAttention(nn.Module):
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.sa_heads = MultiHeadAttention(config)
+        if config.attn_impl == "kda":
+            self.sa_heads = KimiDeltaAttention(config)
+        elif config.attn_impl == "gated_mha":
+            self.sa_heads = MultiHeadAttention(config)
+        else:
+            raise ValueError(f"Unsupported attention implementation: {config.attn_impl}")
         self.ff_layer = FeedForward(config)
         self.sa_norm = RMSNorm(config.embed_size)
         self.ff_norm = RMSNorm(config.embed_size)
@@ -453,6 +670,7 @@ class TransformerLM(nn.Module):
         self.layer_num = config.layer_num
         self.head_num = config.head_num
         self.seq_len = config.seq_len
+        self.attn_impl = config.attn_impl
         # embed raw tokens to a lower dimensional embedding with embed_size
         self.token_embedding_table = nn.Embedding(config.vocab_size, config.embed_size)
         # Language Modelling (?) Head is a standard linear layer to go from 
@@ -463,7 +681,6 @@ class TransformerLM(nn.Module):
 
     def forward(self, idx, targets=None, kv_cache=None):
         B, T = idx.shape
-        _, _, T_past, _ = kv_cache[0][0].shape if kv_cache is not None and kv_cache[0][0] is not None else (0, 0, 0, 0)
         # idx and targets are both (B,T) tensor of integers
         tok_embd = self.token_embedding_table(idx) # (B,T,C)
         x = tok_embd
@@ -488,7 +705,10 @@ class TransformerLM(nn.Module):
     def generate(self, idx, max_new_tokens, temperature=1, use_cache=True):
         if use_cache:
             # initialize key-value cache
-            kv_cache = [(None, None) for _ in range(self.layer_num)]
+            if self.attn_impl == "kda":
+                kv_cache = [{"state": None} for _ in range(self.layer_num)]
+            else:
+                kv_cache = [(None, None) for _ in range(self.layer_num)]
             # idx is (B, T) array of indices in the current context
             # crop idx to the last seq_len tokens
             idx_context = idx[:, -self.seq_len:]
@@ -534,10 +754,18 @@ config = TransformerConfig(
     seq_len=seq_len,
     embed_size=256,
     head_num=4,
-    layer_num=6
+    layer_num=6,
+    attn_impl="kda",
+    kda_expand_v=1.0,
+    kda_num_v_heads=None,
+    kda_allow_neg_eigval=False,
+    kda_use_short_conv=False,
+    kda_norm_eps=1e-6,
 )
+use_compile = config.attn_impl != "kda"
+
 m = TransformerLM(config)
-m = torch.compile(m, options=torch_compile_options, fullgraph=True)
+m = maybe_compile_model(m, use_compile)
 m.to(device)
 xb, yb = get_batch('train', 5, 1)
 logits, loss = m(xb, yb)
@@ -555,16 +783,25 @@ def get_wandb_config(model, optimizer, scheduler, seq_len, batch_size, total_ste
         "optimizer": optimizer.__class__.__name__,
         "scheduler": scheduler.__class__.__name__,
         "initial_lr": optimizer.param_groups[0]['lr'],
+        "attn_impl": model.attn_impl,
     }
     
     # Add model configuration
     config.update({
         "vocab_size": model.token_embedding_table.num_embeddings,
-        "embed_size": model.blocks[0].sa_heads.head_size * model.head_num,
+        "embed_size": model.token_embedding_table.embedding_dim,
         "head_num": model.head_num,
         "layer_num": model.layer_num,
         "total_params": sum(p.numel() for p in model.parameters() if p.requires_grad)
     })
+
+    if model.attn_impl == "kda":
+        kda_layer = model.blocks[0].sa_heads
+        config.update({
+            "kda_expand_v": kda_layer.expand_v,
+            "kda_num_v_heads": kda_layer.num_v_heads,
+            "kda_allow_neg_eigval": kda_layer.allow_neg_eigval,
+        })
     
     # Add scheduler-specific config
     if hasattr(scheduler, 'T_max'):
@@ -576,7 +813,7 @@ def get_wandb_config(model, optimizer, scheduler, seq_len, batch_size, total_ste
 
 # Initialize wandb with automated config
 model = TransformerLM(config)
-model = torch.compile(model, options=torch_compile_options, fullgraph=True)
+model = maybe_compile_model(model, use_compile)
 model.to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=2e-3, fused=True)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
@@ -590,7 +827,7 @@ if use_wandb:
     wandb.init(
         project="transformers-playground",
         config=wandb_config,
-        name="gated_attention-lm-animesubs-256seq-256embed-4head-6layer.AMD"
+        name="kda-lm-animesubs-256seq-256embed-4head-6layer.AMD"
     )
 
 losses, val_losses = train(
@@ -602,6 +839,7 @@ losses, val_losses = train(
     total_steps,
     plot_losses=plot_losses,
     plot_path=plot_path,
+    use_compile=use_compile,
 )
 
 if use_wandb:
@@ -614,7 +852,7 @@ torch.save(model.state_dict(), 'models/TransformerLM.pt')
 # %%
 # Load model
 model = TransformerLM(config)
-model = torch.compile(model, options=torch_compile_options, fullgraph=True)
+model = maybe_compile_model(model, use_compile)
 model.load_state_dict(torch.load('models/TransformerLM.pt'))
 model.to(device)
 
@@ -628,4 +866,3 @@ model.eval()
 idx = encode("You will never")
 print(torch.tensor([idx]))
 print(decode(model.generate(idx=torch.tensor([idx], dtype=torch.long).to(device), max_new_tokens=1000, temperature=0.5, use_cache=True)[0].tolist()))
-
