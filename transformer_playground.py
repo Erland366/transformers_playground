@@ -160,7 +160,21 @@ torch_compile_options = {
     'combo_kernel_foreach_dynamic_shapes': True
 }
 
-@torch.compile(fullgraph=False, options=torch_compile_options)
+use_compile = True
+use_compiled_autograd = True
+
+def maybe_compile_model(model):
+    if not use_compile:
+        return model
+    return torch.compile(model, options=torch_compile_options, fullgraph=True, dynamic=False)
+
+compiled_autograd = torch.compile(
+    fullgraph=False,
+    dynamic=False,
+    options=torch_compile_options,
+)
+
+@torch.compile(fullgraph=False, options=torch_compile_options, dynamic=False)
 def compile_optimizer_lr(opt, scheduler):
     opt.step()
     scheduler.step()
@@ -226,9 +240,16 @@ def train(model, optimizer, scheduler, seq_len, batch_size, total_steps, val_ste
         # backprop
         optimizer.zero_grad(set_to_none=True)
 
-        with torch._dynamo.compiled_autograd._enable(torch.compile()):
+        if use_compile and use_compiled_autograd:
+            with torch._dynamo.compiled_autograd._enable(compiled_autograd):
+                loss.backward()
+        else:
             loss.backward()
-        compile_optimizer_lr(optimizer, scheduler)
+        if use_compile:
+            compile_optimizer_lr(optimizer, scheduler)
+        else:
+            optimizer.step()
+            scheduler.step()
 
         bar.set_description(f"loss: {loss.item():.2f}, val loss: {val_losses[-1] if val_losses else 0:.2f}, lr: {scheduler.get_last_lr()[0]:.2e}")
         losses.append(loss.item())
@@ -537,7 +558,7 @@ config = TransformerConfig(
     layer_num=6
 )
 m = TransformerLM(config)
-m = torch.compile(m, options=torch_compile_options, fullgraph=True)
+m = maybe_compile_model(m)
 m.to(device)
 xb, yb = get_batch('train', 5, 1)
 logits, loss = m(xb, yb)
@@ -576,7 +597,7 @@ def get_wandb_config(model, optimizer, scheduler, seq_len, batch_size, total_ste
 
 # Initialize wandb with automated config
 model = TransformerLM(config)
-model = torch.compile(model, options=torch_compile_options, fullgraph=True)
+model = maybe_compile_model(model)
 model.to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=2e-3, fused=True)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
@@ -614,7 +635,7 @@ torch.save(model.state_dict(), 'models/TransformerLM.pt')
 # %%
 # Load model
 model = TransformerLM(config)
-model = torch.compile(model, options=torch_compile_options, fullgraph=True)
+model = maybe_compile_model(model)
 model.load_state_dict(torch.load('models/TransformerLM.pt'))
 model.to(device)
 
@@ -628,4 +649,3 @@ model.eval()
 idx = encode("You will never")
 print(torch.tensor([idx]))
 print(decode(model.generate(idx=torch.tensor([idx], dtype=torch.long).to(device), max_new_tokens=1000, temperature=0.5, use_cache=True)[0].tolist()))
-
