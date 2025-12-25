@@ -326,15 +326,12 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis.to(device)
 
-def softpick(x, dim: int = -1, eps: float = 1e-8):
-    # softpick function: relu(exp(x)-1) / sum(abs(exp(x)-1))
-    # numerically stable version
+def attention_norm(x, dim: int = -1, p: float = 2.0, eps: float = 1e-12):
+    # Lp-normalized softmax: exp(x) / (sum(exp(p * x)) ** (1/p))
     x_m = torch.max(x, dim=dim, keepdim=True).values
-    x_m_e_m = torch.exp(-x_m)
-    x_e_1 = torch.exp(x - x_m) - x_m_e_m
-    r_x_e_1 = F.relu(x_e_1)
-    a_x_e_1 = torch.where(x.isfinite(), torch.abs(x_e_1), 0)
-    return r_x_e_1 / (torch.sum(a_x_e_1, dim=dim, keepdim=True) + eps)
+    x_e = torch.exp(x - x_m)
+    denom = torch.sum(torch.exp(p * (x - x_m)), dim=dim, keepdim=True).clamp_min(eps).pow(1.0 / p)
+    return x_e / denom
 
 def apply_rotary_emb(
     xq: torch.Tensor,
@@ -426,7 +423,7 @@ class MultiHeadAttention(nn.Module):
         wei = q @ k.transpose(-2,-1) # (B, H, 1, C/H) @ (B, H, C/H, T) -> (B, H, 1, T)
         wei = wei * self.head_size ** -0.5 # scaled attention
         wei = wei.masked_fill(self.tril[T_k-T:T_k, T_k-T:T_k] == 0, float('-inf')) # (B, T, T)
-        wei = softpick(wei, dim=-1) # (B, H, T, T)
+        wei = attention_norm(wei, dim=-1) # (B, H, T, T)
         # apply attention to values
         out = wei @ v # (B, H, 1, T) @ (B, H, T, C/H) -> (B, H, 1, C/H)
 
@@ -501,7 +498,7 @@ class TransformerLM(nn.Module):
                 # apply temperature
                 logits = logits / temperature if temperature > 0 else logits
                 # apply softpick to get probabilities
-                probs = softpick(logits, dim=-1) # (B, C)
+                probs = attention_norm(logits, dim=-1) # (B, C)
                 # sample from the distribution
                 idx_next = torch.multinomial(probs, num_samples=1) if temperature > 0 else torch.argmax(probs, dim=-1, keepdim=True) # (B, 1)
                 # append sampled index to the running sequence
@@ -521,7 +518,7 @@ class TransformerLM(nn.Module):
                 # apply temperature
                 logits = logits / temperature if temperature > 0 else logits
                 # apply softpick to get probabilities
-                probs = softpick(logits, dim=-1) # (B, C)
+                probs = attention_norm(logits, dim=-1) # (B, C)
                 # sample from the distribution
                 idx_next = torch.multinomial(probs, num_samples=1) if temperature > 0 else torch.argmax(probs, dim=-1, keepdim=True) # (B, 1)
                 # append sampled index to the running sequence
@@ -591,7 +588,7 @@ if use_wandb:
     wandb.init(
         project="transformers-playground",
         config=wandb_config,
-        name="softpick-lm-animesubs-256seq-256embed-4head-6layer.AMD"
+        name="attention_norm-lm-animesubs-256seq-256embed-4head-6layer.AMD"
     )
 
 losses, val_losses = train(
@@ -629,4 +626,3 @@ model.eval()
 idx = encode("You will never")
 print(torch.tensor([idx]))
 print(decode(model.generate(idx=torch.tensor([idx], dtype=torch.long).to(device), max_new_tokens=1000, temperature=0.5, use_cache=True)[0].tolist()))
-
