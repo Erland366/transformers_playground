@@ -17,28 +17,6 @@ from datetime import datetime
 load_dotenv()
 
 # %%
-# Softpick function for gated attention experiment
-# Gating normalized over sequence dimension (dim=seq, i.e., dim=1 after reshaping)
-def softpick(x, dim: int = -1, eps: float = 1e-8):
-    """
-    Softpick function: relu(exp(x)-1) / sum(abs(exp(x)-1))
-
-    Unlike sigmoid, softpick normalizes over a dimension, creating competition
-    across that dimension. When dim=1 (seq dimension), gates compete across
-    sequence positions - different tokens compete for influence.
-
-    Key properties:
-    - Zeros out values where exp(x) <= 1 (x <= 0) via relu
-    - Normalizes over the specified dimension
-    - Creates competition/selection across that dimension
-    """
-    x_m = torch.max(x, dim=dim, keepdim=True).values
-    x_m_e_m = torch.exp(-x_m)
-    x_e_1 = torch.exp(x - x_m) - x_m_e_m
-    r_x_e_1 = F.relu(x_e_1)
-    a_x_e_1 = torch.where(x.isfinite(), torch.abs(x_e_1), 0)
-    return r_x_e_1 / (torch.sum(a_x_e_1, dim=dim, keepdim=True) + eps)
-
 use_wandb = True  # set to False to disable wandb logging
 wandb = None
 if use_wandb:
@@ -401,9 +379,10 @@ class MultiHeadAttention(nn.Module):
         self.head_num = config.head_num
         self.head_size = config.embed_size // config.head_num
         self.key = nn.Linear(config.embed_size, config.embed_size, bias=False)
-        self.query = nn.Linear(config.embed_size, config.embed_size * 2, bias=False)
+        self.query = nn.Linear(config.embed_size, config.embed_size, bias=False)
         self.value = nn.Linear(config.embed_size, config.embed_size, bias=False)
         self.o = nn.Linear(config.embed_size, config.embed_size)
+        self.sinks = nn.Parameter(torch.zeros(config.head_num))
         # block_mask for FlexAttention
         def causal(b, h, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
@@ -420,14 +399,9 @@ class MultiHeadAttention(nn.Module):
         v = self.value(x) # (B,T,C)
 
         # Split into heads
-        # q = q.view(B, T, self.head_num, self.head_size).transpose(1, 2) # (B, H, T, C/H)
+        q = q.view(B, T, self.head_num, self.head_size).transpose(1, 2) # (B, H, T, C/H)
         k = k.view(B, T, self.head_num, self.head_size).transpose(1, 2) # (B, H, T, C/H)
         v = v.view(B, T, self.head_num, self.head_size).transpose(1, 2) # (B, H, T, C/H)
-
-        q = q.view(B, T, self.head_num, -1)
-        q, gate_score = torch.split(q, [self.head_size * 1, self.head_size * 1], dim=-1) # For MHA, num_key_value_groups is 1
-        gate_score = gate_score.reshape(B, T, -1, self.head_size)
-        q = q.reshape(B, T, -1, self.head_size).transpose(1, 2)
 
         if kv_cache is not None:
             k_past, v_past = kv_cache
@@ -441,21 +415,23 @@ class MultiHeadAttention(nn.Module):
         T_k = k.shape[-2]
         q, k = apply_rotary_emb(q, k, self.freqs_cis[:T_k])
 
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            dropout_p=0,
-            is_causal=True
+        attn_logits = torch.matmul(q, k.transpose(2, 3)) * (1.0 / math.sqrt(self.head_size))
+        q_len = q.shape[-2]
+        k_len = k.shape[-2]
+        causal_mask = torch.tril(
+            torch.ones((q_len, k_len), device=attn_logits.device, dtype=torch.bool),
+            diagonal=k_len - q_len,
         )
+        attn_logits = attn_logits.masked_fill(~causal_mask, float("-inf"))
+
+        sinks = self.sinks.view(1, self.head_num, 1, 1).expand(B, -1, q_len, 1)
+        combined_logits = torch.cat([attn_logits, sinks], dim=-1)
+        combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+        attn_probs = F.softmax(combined_logits, dim=-1)
+        attn_probs = attn_probs[..., :-1]
+        out = torch.matmul(attn_probs.to(v.dtype), v)
 
         out = out.transpose(1, 2).contiguous()
-        # Softpick gating over sequence dimension (dim=1)
-        # gate_score shape: [B, T, num_heads, head_size]
-        # This makes gates compete across sequence positions
-        out = out * softpick(gate_score, dim=1)
-
         out = out.view(B, T, C) # (B, H, T, C/H) -> (B, T, H, C/H) -> (B, T, C)
         out = self.o(out)
         return out, kv_cache
@@ -579,6 +555,7 @@ def get_wandb_config(model, optimizer, scheduler, seq_len, batch_size, total_ste
         "seq_len": seq_len,
         "batch_size": batch_size,
         "total_steps": total_steps,
+        "attention_sink": "gpt_oss_logit",
         "optimizer": optimizer.__class__.__name__,
         "scheduler": scheduler.__class__.__name__,
         "initial_lr": optimizer.param_groups[0]['lr'],
@@ -617,7 +594,7 @@ if use_wandb:
     wandb.init(
         project="transformers-playground",
         config=wandb_config,
-        name="gated_softpick_seq-lm-animesubs-256seq-256embed-4head-6layer.AMD"
+        name="gpt_oss_sink-lm-animesubs-256seq-256embed-4head-6layer.AMD"
     )
 
 losses, val_losses = train(
@@ -659,4 +636,3 @@ model.eval()
 idx = encode("You will never")
 print(torch.tensor([idx]))
 print(decode(model.generate(idx=torch.tensor([idx], dtype=torch.long).to(device), max_new_tokens=1000, temperature=0.5, use_cache=True)[0].tolist()))
-
