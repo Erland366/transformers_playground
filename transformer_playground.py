@@ -636,6 +636,10 @@ if use_wandb:
 
 # %%
 # Save
+try:
+    os.mkdir(os.path.join(os.getcwd(), "models"))
+except:
+    pass
 torch.save(model.state_dict(), 'models/TransformerLM.pt')
 
 # %%
