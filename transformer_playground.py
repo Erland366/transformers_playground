@@ -156,7 +156,7 @@ print(yb)
 # Make all steps, sequence lengths, and batch size the same
 total_steps = 5000
 seq_len = 128
-batch_size = 64 # these are small models so we can use large batch sizes to fully utilize the GPU
+batch_size = 32 # match naive baseline for apples-to-apples comparison
 # should cover around 2x the dataset
 total_steps * seq_len * batch_size
 
@@ -184,8 +184,8 @@ torch_compile_options = {
     'triton.cooperative_reductions': False, 
     'cuda.compile_opt_level': '-O2', 
     'cuda.enable_cuda_lto': True, 
-    'combo_kernels': True, 
-    'benchmark_combo_kernel': True, 
+    'combo_kernels': False, 
+    'benchmark_combo_kernel': False, 
     'combo_kernel_foreach_dynamic_shapes': True
 }
 
@@ -360,9 +360,9 @@ class TransformerConfig:
         kda_expand_v=1.0,
         kda_num_v_heads=None,
         kda_allow_neg_eigval=False,
-        kda_norm_eps=1e-5,
+        kda_norm_eps=1e-6,
         kda_mode="chunk",
-        kda_use_short_conv=True,
+        kda_use_short_conv=False,
         kda_conv_size=4,
         kda_conv_bias=False,
     ):
@@ -538,6 +538,14 @@ import os
 import triton
 import triton.language as tl
 import triton.language.extra.libdevice as tldevice
+
+try:
+    import torch._inductor.config as inductor_config
+    if hasattr(inductor_config, "triton") and hasattr(inductor_config.triton, "enable_combo_kernel"):
+        # Work around combo-kernel grid codegen issues with torch.compile.
+        inductor_config.triton.enable_combo_kernel = False
+except Exception:
+    pass
 
 
 if os.environ.get('FLA_USE_FAST_OPS', '0') == '1':
@@ -1446,7 +1454,7 @@ def l2norm_bwd_kernel(
 
 def l2norm_fwd(
     x: torch.Tensor,
-    eps: float = 1e-6,
+    eps: float = 1e-12,
     output_dtype: torch.dtype | None = None,
 ):
     x_shape_og = x.shape
@@ -1494,7 +1502,7 @@ def l2norm_bwd(
     y: torch.Tensor,
     rstd: torch.Tensor,
     dy: torch.Tensor,
-    eps: float = 1e-6,
+    eps: float = 1e-12,
 ):
     y_shape_og = y.shape
     y = y.view(-1, dy.shape[-1])
@@ -1544,7 +1552,7 @@ class L2NormFunction(torch.autograd.Function):
     def forward(
         ctx,
         x,
-        eps=1e-6,
+        eps=1e-12,
         output_dtype=None,
     ):
         y, rstd = l2norm_fwd(x, eps, output_dtype)
@@ -1563,7 +1571,7 @@ class L2NormFunction(torch.autograd.Function):
 
 def l2norm(
     x: torch.Tensor,
-    eps: float = 1e-6,
+    eps: float = 1e-12,
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     return L2NormFunction.apply(x, eps, output_dtype)
@@ -1576,7 +1584,7 @@ class L2Norm(nn.Module):
 
     def __init__(
         self,
-        eps: float = 1e-6,
+        eps: float = 1e-12,
         output_dtype: torch.dtype | None = None,
     ):
         super().__init__()
@@ -9546,7 +9554,7 @@ config = TransformerConfig(
 )
 m = TransformerLM(config)
 if use_torch_compile:
-    m = torch.compile(m, options=torch_compile_options, fullgraph=True)
+    m = torch.compile(m, options=torch_compile_options, fullgraph=False)
 m.to(device)
 xb, yb = get_batch('train', 5, 1)
 logits, loss = m(xb, yb)
@@ -9594,7 +9602,7 @@ def get_wandb_config(model, optimizer, scheduler, seq_len, batch_size, total_ste
 # Initialize wandb with automated config
 model = TransformerLM(config)
 if use_torch_compile:
-    model = torch.compile(model, options=torch_compile_options, fullgraph=True)
+    model = torch.compile(model, options=torch_compile_options, fullgraph=False)
 model.to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=2e-3, fused=True)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
@@ -9634,7 +9642,7 @@ torch.save(model.state_dict(), 'models/TransformerLM.pt')
 # Load model
 model = TransformerLM(config)
 if use_torch_compile:
-    model = torch.compile(model, options=torch_compile_options, fullgraph=True)
+    model = torch.compile(model, options=torch_compile_options, fullgraph=False)
 model.load_state_dict(torch.load('checkpoints/checkpoint_step_5000.pt'), strict=False)
 model.to(device)
 
