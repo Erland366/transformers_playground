@@ -2,3 +2,5 @@ checkpoints/
 .env
 models/
 wandb/
+training.log
+sweep_checkpoints/

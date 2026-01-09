@@ -112,7 +112,8 @@ def generate_mixture_of_modality_heads_mask_mod(
     return mixture_of_multimodal_heads_mask_mod
 
 @lru_cache
-def create_block_mask_cached(mask_mod, B, H, M, N, device="cuda"):
+def create_block_mask_cached(mask_mod, B, H, M, N, device="cuda", pct_v=0.4, pct_t=0.4):
+    """Cache block masks by config. pct_v/pct_t included in cache key."""
     block_mask = create_block_mask(mask_mod, B, H, M, N, device=device, _compile=True)
     return block_mask
 
@@ -231,6 +232,11 @@ class VLMConfig:
     head_num: int = 10
     layer_num: int = 6
     dropout: float = 0.1
+
+    # Mixture of Modality Heads Config
+    head_pct_vision: float = 0.4  # % of heads for V->V only
+    head_pct_text: float = 0.4    # % of heads for T->T only
+    # Remaining heads (1 - vision - text) are VT->VT shared
 
     # Training Config
     batch_size: int = 64
@@ -518,12 +524,11 @@ class VLMMultiHeadAttention(nn.Module):
         # FlexAttention block mask with Mixture of Modality Heads
         if self.use_flex_attention:
             # Generate the mixture of modality heads mask
-            # 40% V->V heads, 40% T->T heads, 20% VT->VT heads
             mask_mod = generate_mixture_of_modality_heads_mask_mod(
                 total_heads=self.head_num,
                 S_V=self.num_visual_tokens,
-                pct_heads_V=HEAD_PCT_VISION,
-                pct_heads_T=HEAD_PCT_TEXT
+                pct_heads_V=config.head_pct_vision,
+                pct_heads_T=config.head_pct_text
             )
             # Use cached block mask creation for efficiency across layers
             self.vlm_mask = create_block_mask_cached(
@@ -532,7 +537,9 @@ class VLMMultiHeadAttention(nn.Module):
                 H=self.head_num,
                 M=config.total_seq_len,
                 N=config.total_seq_len,
-                device="cuda"
+                device="cuda",
+                pct_v=config.head_pct_vision,
+                pct_t=config.head_pct_text
             )
         else:
             self.vlm_mask = None
@@ -973,114 +980,115 @@ def get_vlm_wandb_config(model, optimizer, scheduler, config):
         "vision_params": vision_params,
         "projector_params": projector_params,
         "decoder_params": decoder_params,
-        "head_pct_vision": HEAD_PCT_VISION,
-        "head_pct_text": HEAD_PCT_TEXT,
-        "head_pct_shared": 1.0 - HEAD_PCT_VISION - HEAD_PCT_TEXT,
+        "head_pct_vision": config.head_pct_vision,
+        "head_pct_text": config.head_pct_text,
+        "head_pct_shared": 1.0 - config.head_pct_vision - config.head_pct_text,
     }
 
 # %% [markdown]
 # # Main Training
 
-# %%
-# Initialize config
-config = VLMConfig(
-    img_size=96,
-    patch_size=16,
-    image_embed_dim=512,
-    vit_num_layers=4,
-    vit_num_heads=8,
-    vocab_size=vocab_size,
-    embed_size=640,
-    seq_len=256,
-    head_num=10,
-    layer_num=6,
-    batch_size=64 if device.type == 'cuda' else 8,
-    total_steps=2000 if device.type == 'cuda' else 200,
-    learning_rate=2e-3,
-)
-
-# Adjust for CPU
-if device.type == 'cpu':
-    config.val_batch_size = 8
-    config.ppl_val_steps = 50
-    config.ppl_batch_size = 8
-    config.max_new_tokens = 50
-    print(f"CPU settings: batch_size={config.batch_size}, total_steps={config.total_steps}")
-
-print(f"Number of visual tokens: {config.num_visual_tokens}")
-print(f"Total sequence length: {config.total_seq_len}")
-
-# %%
-# Initialize model
-model = VisionLanguageModel(config)
-model = maybe_compile(model)
-model.to(device)
-
-# Test forward pass
-images, input_ids, targets = get_batch('train', 2, config)
-logits, loss = model(images, input_ids, targets)
-print(f"Test forward pass - logits shape: {logits.shape}, loss: {loss.item():.4f}")
-
-total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(f"Total parameters: {total_params:,}")
-
-# %%
-# Initialize optimizer and scheduler
-optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, fused=use_fused_optimizer)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.total_steps, eta_min=1e-6)
-
-# Warmup
-warmup_steps = 10 if device.type == 'cuda' else 0
-print(f"Running {warmup_steps} warmup steps...")
-for _ in range(warmup_steps):
-    images, input_ids, targets = get_batch('train', config.batch_size, config)
-    with autocast_context():
-        model(images, input_ids, targets)
-
-# Initialize wandb
-wandb_config = get_vlm_wandb_config(model, optimizer, scheduler, config)
-if use_wandb:
-    wandb.init(
-        project="tf_chameleon",
-        config=wandb_config,
-        name=f"vlm-coco-{config.img_size}px-{config.embed_size}emb-{config.layer_num}L-442",
-        settings=wandb.Settings(init_timeout=120),
+if __name__ == "__main__":
+    # %%
+    # Initialize config
+    config = VLMConfig(
+        img_size=96,
+        patch_size=16,
+        image_embed_dim=512,
+        vit_num_layers=4,
+        vit_num_heads=8,
+        vocab_size=vocab_size,
+        embed_size=640,
+        seq_len=256,
+        head_num=10,
+        layer_num=6,
+        batch_size=64 if device.type == 'cuda' else 8,
+        total_steps=2000 if device.type == 'cuda' else 200,
+        learning_rate=2e-3,
     )
 
-# Train
-losses, val_losses = train_vlm(model, optimizer, scheduler, config)
+    # Adjust for CPU
+    if device.type == 'cpu':
+        config.val_batch_size = 8
+        config.ppl_val_steps = 50
+        config.ppl_batch_size = 8
+        config.max_new_tokens = 50
+        print(f"CPU settings: batch_size={config.batch_size}, total_steps={config.total_steps}")
 
-if use_wandb:
-    wandb.finish()
+    print(f"Number of visual tokens: {config.num_visual_tokens}")
+    print(f"Total sequence length: {config.total_seq_len}")
 
-# %%
-# Save model
-os.makedirs('models', exist_ok=True)
-torch.save(model.state_dict(), 'models/VLM.pt')
-print("Model saved to models/VLM.pt")
+    # %%
+    # Initialize model
+    model = VisionLanguageModel(config)
+    model = maybe_compile(model)
+    model.to(device)
 
-# %%
-# Load model (example)
-# model = VisionLanguageModel(config)
-# model = maybe_compile(model)
-# model.load_state_dict(torch.load('models/VLM.pt'))
-# model.to(device)
+    # Test forward pass
+    images, input_ids, targets = get_batch('train', 2, config)
+    logits, loss = model(images, input_ids, targets)
+    print(f"Test forward pass - logits shape: {logits.shape}, loss: {loss.item():.4f}")
 
-# %%
-# Calculate perplexity
-ppl, loss = perplexity_vlm(model, config, val_steps=config.ppl_val_steps)
-print(f"Perplexity: {ppl:.2f}, Loss: {loss:.4f}")
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
 
-# %%
-# Generation demo
-model.eval()
-sample_idx = 0
-sample_image = train_df.iloc[sample_idx]['image']
-img_tensor = image_transform(process_image(sample_image)).unsqueeze(0).to(device)
+    # %%
+    # Initialize optimizer and scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, fused=use_fused_optimizer)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.total_steps, eta_min=1e-6)
 
-print("Generating caption...")
-with torch.no_grad():
-    generated = model.generate(img_tensor, max_new_tokens=config.max_new_tokens, temperature=0.7, use_cache=True)
+    # Warmup
+    warmup_steps = 10 if device.type == 'cuda' else 0
+    print(f"Running {warmup_steps} warmup steps...")
+    for _ in range(warmup_steps):
+        images, input_ids, targets = get_batch('train', config.batch_size, config)
+        with autocast_context():
+            model(images, input_ids, targets)
 
-print(f"Generated caption: {decode(generated[0].tolist())}")
-print(f"Actual caption: {train_df.iloc[sample_idx]['caption']}")
+    # Initialize wandb
+    wandb_config = get_vlm_wandb_config(model, optimizer, scheduler, config)
+    if use_wandb:
+        wandb.init(
+            project="tf_chameleon",
+            config=wandb_config,
+            name=f"vlm-coco-{config.img_size}px-{config.embed_size}emb-{config.layer_num}L-442",
+            settings=wandb.Settings(init_timeout=120),
+        )
+
+    # Train
+    losses, val_losses = train_vlm(model, optimizer, scheduler, config)
+
+    if use_wandb:
+        wandb.finish()
+
+    # %%
+    # Save model
+    os.makedirs('models', exist_ok=True)
+    torch.save(model.state_dict(), 'models/VLM.pt')
+    print("Model saved to models/VLM.pt")
+
+    # %%
+    # Load model (example)
+    # model = VisionLanguageModel(config)
+    # model = maybe_compile(model)
+    # model.load_state_dict(torch.load('models/VLM.pt'))
+    # model.to(device)
+
+    # %%
+    # Calculate perplexity
+    ppl, loss = perplexity_vlm(model, config, val_steps=config.ppl_val_steps)
+    print(f"Perplexity: {ppl:.2f}, Loss: {loss:.4f}")
+
+    # %%
+    # Generation demo
+    model.eval()
+    sample_idx = 0
+    sample_image = train_df.iloc[sample_idx]['image']
+    img_tensor = image_transform(process_image(sample_image)).unsqueeze(0).to(device)
+
+    print("Generating caption...")
+    with torch.no_grad():
+        generated = model.generate(img_tensor, max_new_tokens=config.max_new_tokens, temperature=0.7, use_cache=True)
+
+    print(f"Generated caption: {decode(generated[0].tolist())}")
+    print(f"Actual caption: {train_df.iloc[sample_idx]['caption']}")

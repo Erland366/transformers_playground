@@ -1,0 +1,43 @@
+program: vlm_sweep.py
+method: bayes
+metric:
+  name: val_loss
+  goal: minimize
+parameters:
+  learning_rate:
+    distribution: log_uniform_values
+    min: 1e-4
+    max: 1e-2
+  batch_size:
+    values: [32, 64, 128]
+  # Model capacity - Text decoder
+  embed_size:
+    values: [320, 640]  # Must be divisible by head_num (10)
+  head_num:
+    values: [10]  # Fixed for clean head ratios
+  layer_num:
+    values: [4, 6, 8]
+  # Model capacity - Vision encoder
+  vit_num_layers:
+    values: [2, 4, 6]
+  vit_num_heads:
+    values: [4, 8]
+  image_embed_dim:
+    values: [256, 512]
+  # Mixture of Modality Heads ratios
+  # With 10 heads: (V, T, VT) counts
+  head_pct_vision:
+    values: [0.2, 0.3, 0.4, 0.5, 0.6]  # 2-6 heads for V->V
+  head_pct_text:
+    values: [0.2, 0.3, 0.4, 0.5, 0.6]  # 2-6 heads for T->T
+  # Note: VT heads = 10 - V - T (remaining)
+  # Example distributions with 10 heads:
+  # (0.4, 0.4) -> 4-4-2 (balanced)
+  # (0.5, 0.3) -> 5-3-2 (vision-heavy)
+  # (0.3, 0.5) -> 3-5-2 (text-heavy)
+  # (0.3, 0.3) -> 3-3-4 (shared-heavy)
+  # (0.6, 0.2) -> 6-2-2 (very vision-heavy)
+early_terminate:
+  type: hyperband
+  min_iter: 100
+  eta: 3
