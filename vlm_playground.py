@@ -85,10 +85,10 @@ plt.rcParams['ytick.minor.visible'] = True
 print(f"Device: {device}")
 
 # %% [markdown]
-# # Data Loading - COCO Captions
+# # Data Loading - The Cauldron (Streaming)
 
 # %%
-from datasets import load_dataset, Dataset, DatasetDict
+from datasets import load_dataset, IterableDataset
 
 img_size = 96
 
@@ -101,35 +101,71 @@ def get_image_transform(img_size=96):
 
 image_transform = get_image_transform(img_size)
 
-print("Loading COCO Captions dataset...")
-df = load_dataset("Erland/coco_captions_small")
-print(f"Dataset loaded: {df}")
+# Load The Cauldron dataset with streaming (no download needed)
+print("Loading The Cauldron dataset with streaming...")
+# Using 'ai2d' subset - you can change to other subsets like 'aokvqa', 'chart2text', etc.
+CAULDRON_SUBSET = "ai2d"
+train_stream = load_dataset(
+    "HuggingFaceM4/the_cauldron",
+    name=CAULDRON_SUBSET,
+    split="train",
+    streaming=True
+)
+print(f"Streaming dataset loaded: {CAULDRON_SUBSET}")
 
-# Convert to pandas for easier manipulation
-if isinstance(df, DatasetDict):
-    df = df["train"]
-df_pandas = df.to_pandas()
+# Iterators will be created on demand in get_batch()
 
-# Split into train/val
-n = int(0.9 * len(df_pandas))
-train_df = df_pandas.iloc[:n].reset_index(drop=True)
-val_df = df_pandas.iloc[n:].reset_index(drop=True)
-print(f"Train samples: {len(train_df)}, Val samples: {len(val_df)}")
+def format_cauldron_text(texts_list):
+    """Format the cauldron conversation format into a caption string"""
+    if not texts_list:
+        return ""
+    # Combine user question and assistant answer
+    parts = []
+    for turn in texts_list:
+        if 'user' in turn:
+            parts.append(turn['user'])
+        if 'assistant' in turn:
+            parts.append(turn['assistant'])
+    return " ".join(parts)
+
+def get_next_samples(iterator, n, fallback_iter=None):
+    """Get n samples from streaming iterator, reset if exhausted"""
+    samples = []
+    for _ in range(n):
+        try:
+            sample = next(iterator)
+            samples.append(sample)
+        except StopIteration:
+            # Reset iterator
+            if fallback_iter is not None:
+                iterator = fallback_iter
+            samples.append(next(iterator))
+    return samples
+
+print(f"Dataset ready for streaming")
 
 # %% [markdown]
 # # Tokenizer
 
 # %%
-# Build character-level tokenizer from captions
-text = "".join(df_pandas["caption"].tolist())
-chars = sorted(list(set(text)))
+# Fixed character-level tokenizer (can't scan streaming dataset)
+# Include printable ASCII + common unicode characters
+import string
+chars = list(string.printable)  # All printable ASCII characters
+# Add some common special chars that might appear in VQA data
+extra_chars = ['°', '²', '³', '×', '÷', '±', '≤', '≥', '≠', '→', '←', '↑', '↓']
+chars = sorted(list(set(chars + extra_chars)))
 vocab_size = len(chars)
-print(f"Unique characters: {vocab_size}")
+print(f"Base characters: {vocab_size}")
 
 stoi = {ch: i for i, ch in enumerate(chars)}
 itos = {i: ch for i, ch in enumerate(chars)}
 
 # Add special tokens
+unk_idx = len(stoi)
+stoi['<unk>'] = unk_idx
+itos[unk_idx] = '<unk>'
+
 pad_idx = len(stoi)
 stoi['<pad>'] = pad_idx
 itos[pad_idx] = '<pad>'
@@ -145,8 +181,9 @@ itos[eos_idx] = '<eos>'
 vocab_size = len(stoi)
 print(f"Vocab size (with special tokens): {vocab_size}")
 
-encode = lambda s: [stoi[c] for c in s if c in stoi]
-decode = lambda l: ''.join([itos[i] for i in l if i in itos and itos[i] not in ['<pad>', '<bos>', '<eos>']])
+# Handle unknown characters with <unk>
+encode = lambda s: [stoi.get(c, unk_idx) for c in s]
+decode = lambda l: ''.join([itos[i] for i in l if i in itos and itos[i] not in ['<pad>', '<bos>', '<eos>', '<unk>']])
 
 # Test tokenizer
 print("Encoded:", encode("A cat on a mat"))
@@ -688,20 +725,71 @@ def process_image(img):
     else:
         raise ValueError(f"Unknown image format: {type(img)}")
 
-def get_batch(split, batch_size, config):
-    data = train_df if split == 'train' else val_df
-    replace = len(data) < batch_size
-    batch = data.sample(n=batch_size, replace=replace)
+# Global iterators for streaming (reset when exhausted)
+_train_iter = None
+_val_iter = None
 
-    # Process images
-    images = torch.stack([
-        image_transform(process_image(img))
-        for img in batch['image']
-    ]).to(device)
+def get_streaming_iterator(split):
+    """Get or reset streaming iterator"""
+    global _train_iter, _val_iter, train_stream
+    if split == 'train':
+        if _train_iter is None:
+            _train_iter = iter(train_stream)
+        return _train_iter
+    else:
+        if _val_iter is None:
+            _val_iter = iter(train_stream.shuffle(seed=42, buffer_size=1000))
+        return _val_iter
+
+def reset_iterator(split):
+    """Reset iterator when exhausted"""
+    global _train_iter, _val_iter, train_stream
+    if split == 'train':
+        _train_iter = iter(train_stream)
+        return _train_iter
+    else:
+        _val_iter = iter(train_stream.shuffle(seed=42, buffer_size=1000))
+        return _val_iter
+
+def get_batch(split, batch_size, config):
+    """Get batch from streaming dataset"""
+    global _train_iter, _val_iter
+
+    iterator = get_streaming_iterator(split)
+
+    images_list = []
+    captions_list = []
+
+    for _ in range(batch_size):
+        try:
+            sample = next(iterator)
+        except StopIteration:
+            # Reset iterator
+            iterator = reset_iterator(split)
+            sample = next(iterator)
+
+        # Extract image (first image from the list)
+        if sample['images'] and len(sample['images']) > 0:
+            img = sample['images'][0]
+            try:
+                processed_img = image_transform(process_image(img))
+                images_list.append(processed_img)
+            except Exception as e:
+                # Skip bad images, use a blank image
+                images_list.append(torch.zeros(3, config.img_size, config.img_size))
+        else:
+            images_list.append(torch.zeros(3, config.img_size, config.img_size))
+
+        # Extract text (format the conversation)
+        caption = format_cauldron_text(sample.get('texts', []))
+        captions_list.append(caption)
+
+    # Stack images
+    images = torch.stack(images_list).to(device)
 
     # Process captions
     encoded_captions = []
-    for caption in batch['caption']:
+    for caption in captions_list:
         enc = [bos_idx] + encode(caption)[:config.max_caption_len - 2] + [eos_idx]
         encoded_captions.append(enc)
 
@@ -982,7 +1070,7 @@ if use_wandb:
     wandb.init(
         project="transformers-playground",
         config=wandb_config,
-        name=f"vlm-coco-{config.img_size}px-{config.embed_size}emb-{config.layer_num}L",
+        name=f"vlm-cauldron-{CAULDRON_SUBSET}-{config.img_size}px-{config.embed_size}emb-{config.layer_num}L",
         settings=wandb.Settings(init_timeout=120),
     )
 
@@ -1013,13 +1101,20 @@ print(f"Perplexity: {ppl:.2f}, Loss: {loss:.4f}")
 # %%
 # Generation demo
 model.eval()
-sample_idx = 0
-sample_image = train_df.iloc[sample_idx]['image']
-img_tensor = image_transform(process_image(sample_image)).unsqueeze(0).to(device)
+# Get a sample from the streaming dataset
+sample_iter = iter(train_stream)
+sample = next(sample_iter)
+sample_image = sample['images'][0] if sample['images'] else None
+actual_text = format_cauldron_text(sample.get('texts', []))
 
-print("Generating caption...")
-with torch.no_grad():
-    generated = model.generate(img_tensor, max_new_tokens=config.max_new_tokens, temperature=0.7, use_cache=True)
+if sample_image is not None:
+    img_tensor = image_transform(process_image(sample_image)).unsqueeze(0).to(device)
 
-print(f"Generated caption: {decode(generated[0].tolist())}")
-print(f"Actual caption: {train_df.iloc[sample_idx]['caption']}")
+    print("Generating response...")
+    with torch.no_grad():
+        generated = model.generate(img_tensor, max_new_tokens=config.max_new_tokens, temperature=0.7, use_cache=True)
+
+    print(f"Generated: {decode(generated[0].tolist())}")
+    print(f"Actual: {actual_text[:200]}...")
+else:
+    print("No image in sample for generation demo")
