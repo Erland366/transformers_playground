@@ -253,9 +253,9 @@ torch_compile_options = {
     'triton.cooperative_reductions': False,
     'cuda.compile_opt_level': '-O2',
     'cuda.enable_cuda_lto': True,
-    'combo_kernels': True,
-    'benchmark_combo_kernel': True,
-    'combo_kernel_foreach_dynamic_shapes': True
+    'combo_kernels': False,
+    'benchmark_combo_kernel': False,
+    'combo_kernel_foreach_dynamic_shapes': False
 }
 
 if use_torch_compile:
@@ -934,7 +934,7 @@ config = VLMConfig(
     head_num=4,
     layer_num=6,
     batch_size=64 if device.type == 'cuda' else 8,
-    total_steps=5000 if device.type == 'cuda' else 200,
+    total_steps=2000 if device.type == 'cuda' else 200,
     learning_rate=2e-3,
 )
 
