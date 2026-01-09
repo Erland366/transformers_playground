@@ -4,19 +4,14 @@ import math
 import contextlib
 import shutil
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Optional, Tuple, List, Dict
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import torchvision.transforms as transforms
 from PIL import Image
-try:
-    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-    _has_flex_attention = True
-except Exception:
-    flex_attention = None
-    create_block_mask = None
-    _has_flex_attention = False
+from torch.nn.attention.flex_attention import flex_attention as _flex_attention, create_block_mask
 from tqdm.auto import tqdm
 from dotenv import load_dotenv
 import matplotlib.pyplot as plt
@@ -42,6 +37,12 @@ torch.manual_seed(69)
 torch.set_printoptions(profile="short", sci_mode=False, linewidth=100000)
 torch.set_float32_matmul_precision('high')
 
+# Dynamo cache configuration for flex_attention
+torch._dynamo.config.cache_size_limit = 1000
+
+# Compile flex_attention for better performance with custom masks
+flex_attention = torch.compile(_flex_attention, dynamic=False, fullgraph=True)
+
 is_cuda = torch.cuda.is_available()
 is_rocm = is_cuda and torch.version.hip is not None
 
@@ -57,8 +58,63 @@ if rocm_runtime_present() and torch.version.hip is None:
 device = torch.device('cuda' if is_cuda else 'cpu')
 device_type = device.type
 use_torch_compile = device.type == 'cuda'
-use_flex_attention = _has_flex_attention and device.type == 'cuda' and not is_rocm
+use_flex_attention = device.type == 'cuda' and not is_rocm
 use_fused_optimizer = device.type == 'cuda' and not is_rocm
+
+# Mixture of Modality Heads Configuration
+# 40% heads for V->V, 40% heads for T->T, 20% heads for VT->VT
+HEAD_PCT_VISION = 0.4
+HEAD_PCT_TEXT = 0.4
+
+def generate_mixture_of_modality_heads_mask_mod(
+    total_heads: int,
+    S_V: int,
+    pct_heads_V: float,
+    pct_heads_T: float
+):
+    """
+    Generates a compile-friendly (single-return) mask_mod function
+    based on percentages of heads and V/T split.
+    """
+    # Calculate the number of heads for each group
+    H_V_count = int(total_heads * pct_heads_V)
+    H_T_count = int(total_heads * pct_heads_T)
+    H_VT_count = total_heads - H_V_count - H_T_count
+
+    # Calculate the head index boundaries
+    H_T_start_index = H_V_count
+    H_VT_start_index = H_V_count + H_T_count
+
+    # Print the allocation for verification
+    print("--- Mask Generator Configuration ---")
+    print(f"Total Heads: {total_heads}")
+    print(f"S_V (Vision Tokens): {S_V}")
+    print(f"Head Group V->V:   [0..{H_T_start_index - 1}] ({H_V_count} heads)")
+    print(f"Head Group T->T:   [{H_T_start_index}..{H_VT_start_index - 1}] ({H_T_count} heads)")
+    print(f"Head Group VT->VT: [{H_VT_start_index}..{total_heads - 1}] ({H_VT_count} heads)")
+    print("------------------------------------")
+
+    def mixture_of_multimodal_heads_mask_mod(b, h, q_idx, kv_idx):
+        # Group 1: V -> V (active for h < H_T_start_index)
+        head_V = (h < H_T_start_index) & (q_idx < S_V) & (kv_idx < S_V)
+
+        # Group 2: T -> T (active for H_T_start_index <= h < H_VT_start_index)
+        head_T = (h >= H_T_start_index) & (h < H_VT_start_index) & \
+                 (q_idx >= S_V) & (kv_idx >= S_V) & (q_idx >= kv_idx)
+
+        # Group 3: VT -> VT (active for h >= H_VT_start_index)
+        head_VT = (h >= H_VT_start_index) & \
+                  ((kv_idx < S_V) | (q_idx >= kv_idx))
+
+        # Combine all masks. Only one group will be True for any given 'h'.
+        return head_V | head_T | head_VT
+
+    return mixture_of_multimodal_heads_mask_mod
+
+@lru_cache
+def create_block_mask_cached(mask_mod, B, H, M, N, device="cuda"):
+    block_mask = create_block_mask(mask_mod, B, H, M, N, device=device, _compile=True)
+    return block_mask
 
 autocast_dtype = None
 if device.type == 'cuda':
@@ -170,9 +226,9 @@ class VLMConfig:
 
     # Text Decoder Config
     vocab_size: int = vocab_size
-    embed_size: int = 256
+    embed_size: int = 640
     seq_len: int = 256
-    head_num: int = 4
+    head_num: int = 10
     layer_num: int = 6
     dropout: float = 0.1
 
@@ -459,23 +515,25 @@ class VLMMultiHeadAttention(nn.Module):
         self.value = nn.Linear(config.embed_size, config.embed_size, bias=False)
         self.o = nn.Linear(config.embed_size, config.embed_size)
 
-        # FlexAttention block mask for VLM
+        # FlexAttention block mask with Mixture of Modality Heads
         if self.use_flex_attention:
-            num_visual = self.num_visual_tokens
-            def vlm_mask(b, h, q_idx, kv_idx):
-                # Visual tokens can attend to all visual tokens
-                # Text tokens can attend to all visual tokens and previous text tokens (causal)
-                is_q_visual = q_idx < num_visual
-                is_kv_visual = kv_idx < num_visual
-                # Visual-to-visual: full attention
-                # Visual-to-text: not allowed (visual doesn't attend to text)
-                # Text-to-visual: full attention
-                # Text-to-text: causal
-                visual_to_visual = is_q_visual & is_kv_visual
-                text_to_visual = (~is_q_visual) & is_kv_visual
-                text_to_text_causal = (~is_q_visual) & (~is_kv_visual) & (q_idx >= kv_idx)
-                return visual_to_visual | text_to_visual | text_to_text_causal
-            self.vlm_mask = create_block_mask(vlm_mask, B=None, H=None, Q_LEN=config.total_seq_len, KV_LEN=config.total_seq_len)
+            # Generate the mixture of modality heads mask
+            # 40% V->V heads, 40% T->T heads, 20% VT->VT heads
+            mask_mod = generate_mixture_of_modality_heads_mask_mod(
+                total_heads=self.head_num,
+                S_V=self.num_visual_tokens,
+                pct_heads_V=HEAD_PCT_VISION,
+                pct_heads_T=HEAD_PCT_TEXT
+            )
+            # Use cached block mask creation for efficiency across layers
+            self.vlm_mask = create_block_mask_cached(
+                mask_mod,
+                B=None,
+                H=self.head_num,
+                M=config.total_seq_len,
+                N=config.total_seq_len,
+                device="cuda"
+            )
         else:
             self.vlm_mask = None
 
@@ -915,6 +973,9 @@ def get_vlm_wandb_config(model, optimizer, scheduler, config):
         "vision_params": vision_params,
         "projector_params": projector_params,
         "decoder_params": decoder_params,
+        "head_pct_vision": HEAD_PCT_VISION,
+        "head_pct_text": HEAD_PCT_TEXT,
+        "head_pct_shared": 1.0 - HEAD_PCT_VISION - HEAD_PCT_TEXT,
     }
 
 # %% [markdown]
@@ -929,9 +990,9 @@ config = VLMConfig(
     vit_num_layers=4,
     vit_num_heads=8,
     vocab_size=vocab_size,
-    embed_size=256,
+    embed_size=640,
     seq_len=256,
-    head_num=4,
+    head_num=10,
     layer_num=6,
     batch_size=64 if device.type == 'cuda' else 8,
     total_steps=2000 if device.type == 'cuda' else 200,
@@ -980,9 +1041,9 @@ for _ in range(warmup_steps):
 wandb_config = get_vlm_wandb_config(model, optimizer, scheduler, config)
 if use_wandb:
     wandb.init(
-        project="transformers-playground",
+        project="tf_chameleon",
         config=wandb_config,
-        name=f"vlm-coco-{config.img_size}px-{config.embed_size}emb-{config.layer_num}L",
+        name=f"vlm-coco-{config.img_size}px-{config.embed_size}emb-{config.layer_num}L-442",
         settings=wandb.Settings(init_timeout=120),
     )
 
