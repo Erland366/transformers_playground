@@ -811,9 +811,7 @@ def save_vlm_checkpoint(model, optimizer, scheduler, step, losses, val_losses, c
     checkpoint_path = os.path.join(save_dir, f'vlm_checkpoint_step_{step}.pt')
     torch.save(checkpoint, checkpoint_path)
 
-    if use_wandb:
-        wandb.save(checkpoint_path)
-
+    # Checkpoints saved locally only (not uploaded to W&B to save storage)
     print(f"VLM Checkpoint saved at step {step}: {checkpoint_path}")
     return checkpoint_path
 
