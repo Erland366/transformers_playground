@@ -1,0 +1,26 @@
+{
+  "domain": "research",
+  "version": "1.0.0",
+  "created": "2026-01-15",
+  "updated": "2026-01-15",
+  "skills": {
+    "domain-advisor": {
+      "type": "core",
+      "description": "Plan experiments using past knowledge"
+    },
+    "domain-retrospective": {
+      "type": "core",
+      "description": "Document findings as reusable skills"
+    },
+    "gradient-accumulation-deterministic": {
+      "type": "result",
+      "description": "Deterministic gradient accumulation for reproducible training"
+    }
+  },
+  "paths": {
+    "reports": "training_reports/",
+    "experiment_log": "references/experiment-log.md",
+    "troubleshooting": "references/troubleshooting.md",
+    "templates": "templates/"
+  }
+}

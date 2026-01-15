@@ -211,44 +211,54 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
 
 threshold = 0.5
 
-def train(model, optimizer, scheduler, seq_len, batch_size, total_steps, val_steps=10, val_interval=50, checkpoint_interval=500, save_dir='checkpoints'):
+def train(model, optimizer, scheduler, seq_len, batch_size, total_steps, val_steps=10, val_interval=50, checkpoint_interval=500, save_dir='checkpoints', gradient_accumulation_steps=1):
     losses = []
     val_losses = []
     # Create save directory
     os.makedirs(save_dir, exist_ok=True)
-    
+
     # live plot
     fig, ax = plt.subplots()
     dh = display.display(fig, display_id=True)
-    
-    for step in (bar := tqdm(range(total_steps))):
-        # sample a batch of data
-        xb, yb = get_batch('train', seq_len=seq_len, batch_size=batch_size)
 
-        # evaluate the loss
-        p = torch.rand(1).item()
-        # print(f"{p=:.4f}, threshold={threshold}")
-        if p < threshold:
-            # print("Using standard softmax at step", step)
-            logits, loss = model(xb, yb, use_silu_softpick=False)
-        else:
-            # print("Using SiLU softpick at step", step)
-            logits, loss = model(xb, yb, use_silu_softpick=True)
-        # backprop
+    for step in (bar := tqdm(range(total_steps))):
+        accumulated_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
 
-        compile_autograd = torch._dynamo.compiled_autograd._enable(torch.compile()) if use_compile else nullcontext()
-        with compile_autograd:
-            loss.backward()
+        for micro_step in range(gradient_accumulation_steps):
+            # sample a batch of data
+            xb, yb = get_batch('train', seq_len=seq_len, batch_size=batch_size)
+
+            # evaluate the loss
+            p = torch.rand(1).item()
+            # print(f"{p=:.4f}, threshold={threshold}")
+            if p < threshold:
+                # print("Using standard softmax at step", step)
+                logits, loss = model(xb, yb, use_silu_softpick=False)
+            else:
+                # print("Using SiLU softpick at step", step)
+                logits, loss = model(xb, yb, use_silu_softpick=True)
+
+            # scale loss for gradient accumulation (average over micro-batches)
+            scaled_loss = loss / gradient_accumulation_steps
+            accumulated_loss += loss.item()
+
+            # backprop (gradients accumulate automatically)
+            compile_autograd = torch._dynamo.compiled_autograd._enable(torch.compile()) if use_compile else nullcontext()
+            with compile_autograd:
+                scaled_loss.backward()
+
+        # optimizer step after accumulating gradients
         compile_optimizer_lr(optimizer, scheduler)
 
-        bar.set_description(f"loss: {loss.item():.2f}, val loss: {val_losses[-1] if val_losses else 0:.2f}, lr: {scheduler.get_last_lr()[0]:.2e}")
-        losses.append(loss.item())
-        
+        avg_loss = accumulated_loss / gradient_accumulation_steps
+        bar.set_description(f"loss: {avg_loss:.2f}, val loss: {val_losses[-1] if val_losses else 0:.2f}, lr: {scheduler.get_last_lr()[0]:.2e}")
+        losses.append(avg_loss)
+
         # Log to wandb
         if use_wandb:
             wandb.log({
-                'train_loss': loss.item(),
+                'train_loss': avg_loss,
                 'learning_rate': scheduler.get_last_lr()[0],
                 'step': step
             })
@@ -282,7 +292,7 @@ def train(model, optimizer, scheduler, seq_len, batch_size, total_steps, val_ste
         if step % checkpoint_interval == 0 and step > 0:
             save_checkpoint(model, optimizer, scheduler, step, losses, val_losses, seq_len, batch_size, total_steps, save_dir)
             
-    print('final loss:', loss.item(), 'final val loss:', val_loss)
+    print('final loss:', avg_loss, 'final val loss:', val_loss)
     
     # Save final checkpoint
     save_checkpoint(model, optimizer, scheduler, total_steps, losses, val_losses, seq_len, batch_size, total_steps, save_dir)

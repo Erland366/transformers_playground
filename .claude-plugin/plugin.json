@@ -1,0 +1,30 @@
+{
+  "name": "research-skills",
+  "version": "1.0.0",
+  "description": "ML research experiment management. Use when: (1) Planning training runs or hyperparameter sweeps, (2) Documenting model experiments and ablations, (3) Tracking what worked/failed across training sessions",
+  "author": {
+    "name": ""
+  },
+  "skills": ".codex/skills",
+  "domain": "research",
+  "triggers": {
+    "advise": {
+      "patterns": [
+        "<advise>",
+        "experiment plan",
+        "what hyperparameters",
+        "training suggestions"
+      ],
+      "skill": "domain-advisor"
+    },
+    "retrospective": {
+      "patterns": [
+        "<retrospective>",
+        "what worked",
+        "summarize training",
+        "document findings"
+      ],
+      "skill": "domain-retrospective"
+    }
+  }
+}
